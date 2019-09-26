@@ -4,6 +4,9 @@
 #include <QMainWindow>
 #include <QGraphicsScene>
 #include <QFileInfo>
+#include <QSpinBox>
+#include <QMessageBox>
+
 using namespace std;
 
 namespace Ui {
@@ -27,6 +30,10 @@ private slots:
 
     void on_pushButton_4_clicked();
 
+    void on_pushButton_5_clicked();
+
+    void on_pushButton_6_clicked();
+
 private:
     enum eView
     {
@@ -49,6 +56,8 @@ private:
     QGraphicsScene *scene1;
     QGraphicsScene *scene2;
 
+    QSpinBox spinBox;
+
     string datFilename;
     QFileInfo openedFileInfo;
     bool bBatchActive;
@@ -57,7 +66,9 @@ private:
     void LineSplit();
     void WordSplit();
     void HorizontalRlsa();
+    void HorizontalRlsaWords();
     void BatchProcess();
+    void FuzzyRlsa();
 
 
     void SetImageToView(QImage *pImg, eView view);

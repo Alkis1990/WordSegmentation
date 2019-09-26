@@ -16,6 +16,8 @@
 #include <string>
 #include <iostream>
 #include <fstream>
+#include <queue>
+#include <algorithm>
 
 #include "Util.h"
 
@@ -30,15 +32,27 @@ using namespace std;
 Mat src, edges;
 Mat src_gray;
 
+cv::Vec3b red(255,0,0);
+cv::Vec3b green(0,255,0);
+cv::Vec3b blue(0,0,255);
+cv::Vec3b brown(255, 255, 0);
+cv::Vec3b greenblue(0, 255, 255);
+cv::Vec3b purple(255, 0, 255);
+
+cv::Vec3b colours[] = {red, blue, green, brown, greenblue, purple};
+
+cv::Vec3b black(0, 0, 0);
+
 /////////////////////////////////////////////
 //helper functions
 
 void findPeaks(vector<float> x0, vector<int>& peakInds);
-void horRlsa(const Mat &imgIn, Mat &imgOut);
+void horRlsa(const Mat &imgIn, Mat &imgOut, int rlsaThres);
 void convertQImageToMat(QImage *qImg, Mat &matImg);
 void convertMatToQimage(Mat &matImg, QImage *qImg);
-std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag);
-
+std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram);
+void fuzzyRlsa(const Mat &imgIn, Mat &imgOut);
+void blobDetectionLines(Mat &imgGray, Mat &mask, int minWidth, int minHeight);
 /////////////////////////////////////////////
 
 
@@ -67,7 +81,9 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->actionLine_Split, &QAction::triggered, this, &MainWindow::LineSplit);
     connect(ui->actionWord_Split, &QAction::triggered, this, &MainWindow::WordSplit);
     connect(ui->actionHorizontal_Rlsa, &QAction::triggered, this, &MainWindow::HorizontalRlsa);
+    connect(ui->actionHorizontal_Rlsa_words, &QAction::triggered, this, &MainWindow::HorizontalRlsaWords);
     connect(ui->actionBatch_Process, &QAction::triggered, this, &MainWindow::BatchProcess);
+    connect(ui->actionFuzzy_Runlength, &QAction::triggered, this, &MainWindow::FuzzyRlsa);
 }
 
 void clearImage(QImage *img)
@@ -103,7 +119,10 @@ void MainWindow::BatchProcess()
         LineSplit();
         //find words
         WordSplit();
-
+        //rlsa lines
+        HorizontalRlsa();
+        //rlsa words
+        HorizontalRlsaWords();
     }
     bBatchActive = false;
     information = "Batch Prossess for Directory: " + directory.absolutePath() + " is Finished";
@@ -188,16 +207,35 @@ void MainWindow::LineSplit() {
 
     convertQImageToMat(Image2, image1);
 
-    std::vector<int> linesIndex = linesPosition(image1,tagImage);
-
-    for (uint i = 0; i < linesIndex.size(); ++i)
-    {
-        //draw line point
-        line(image1, Point(0, linesIndex[i]), Point(image1.cols, linesIndex[i]), Scalar(0, 255, 0),4);
-    }
+    std::vector<int> linesHist;
+    std::vector<int> linesIndex = linesPosition(image1,tagImage,linesHist);
 
     if(!bBatchActive) //show output if Batch is inactive
     {
+        //normalize histogram and add it into final image
+        auto result = std::minmax_element (linesHist.begin(), linesHist.end());
+        int max = *result.second;
+        int min = *result.first;
+
+        for (uint i = 0; i < linesHist.size(); ++i)
+        {
+          linesHist[i] = (linesHist[i] - min) * 60 / (max - min);
+          for (uint c=0; c < linesHist[i]; ++c)
+          {
+            image1.at<Vec3b>(Point(c,i)) = black;
+          }
+        }
+
+        //color image1 using tagImage to show lines
+        for(int r=0; r<tagImage.rows; ++r){
+            for(int c=0; c<tagImage.cols; ++c){
+                uchar tagValue = tagImage.at<uchar>(r,c);
+                if (tagValue == 0) {continue;}
+
+                image1.at<Vec3b>(Point(c,r)) = colours[tagValue % 6];
+            }
+        }
+
         convertMatToQimage(image1, Image2);
         SetImageToView(Image2, eView::second);
     }
@@ -223,14 +261,14 @@ void MainWindow::LineSplit() {
 
 }
 
-void detectWords(Mat &imgIn, Mat &imgOut, Mat &bitmapOfTag)
+void detectWords(Mat &imgIn, Mat &bitmapOfTag)
 {
-    cvtColor(imgIn, imgOut, CV_BGR2GRAY);
-    Mat small = imgOut;
+    Mat imgGray;
+    cvtColor(imgIn, imgGray, CV_BGR2GRAY);
     // morphological gradient
     Mat grad;
     Mat morphKernel = getStructuringElement(MORPH_ELLIPSE, Size(6, 6));
-    morphologyEx(small, grad, MORPH_GRADIENT, morphKernel);
+    morphologyEx(imgGray, grad, MORPH_GRADIENT, morphKernel);
     // binarize
     Mat bw;
     threshold(grad, bw, 0.0, 255.0, THRESH_BINARY | THRESH_OTSU);
@@ -238,8 +276,9 @@ void detectWords(Mat &imgIn, Mat &imgOut, Mat &bitmapOfTag)
     Mat connected;
     morphKernel = getStructuringElement(MORPH_RECT, Size(18, 1));
     morphologyEx(bw, connected, MORPH_CLOSE, morphKernel);
+
     //store tags of words in image
-    bitmapOfTag = Mat::zeros(imgOut.size(), CV_8UC1);
+    bitmapOfTag = Mat::zeros(imgGray.size(), CV_8UC1);
     uchar tag=1;
     // find contours
     Mat mask = Mat::zeros(bw.size(), CV_8UC1);
@@ -248,7 +287,6 @@ void detectWords(Mat &imgIn, Mat &imgOut, Mat &bitmapOfTag)
     hierarchy.size();
     findContours(connected, contours, hierarchy, CV_RETR_CCOMP, CV_CHAIN_APPROX_SIMPLE, Point(0, 0));
     // filter contours
-    //for(int idx = 0; idx >= 0; idx = hierarchy[idx][0])
     for (int idx=contours.size()-1; idx>=0; idx--)
     {
         Rect rect = boundingRect(contours[idx]);
@@ -264,20 +302,48 @@ void detectWords(Mat &imgIn, Mat &imgOut, Mat &bitmapOfTag)
         {
 
             cv::Mat TagRoi = bitmapOfTag(rect);
-            cv::Mat TagSmall = small(rect);
-            for(int j=0;j<TagRoi.rows;j++)
+            cv::Mat TagGray = imgGray(rect);
+            cv::Mat TagConnected = connected(rect);
+            vector<int> wordHist(TagGray.cols, 0);;
+            for (int i=0;i<TagRoi.cols;i++)
             {
-              for (int i=0;i<TagRoi.cols;i++)
+              int blacks=0;
+              for(int j=0;j<TagRoi.rows;j++)
               {
-                  if(TagSmall.at<uchar>(j,i) < 100){
+                  if(TagGray.at<uchar>(j,i) < 100)
+                  {
                      TagRoi.at<uchar>(j,i) = tag;
+
+                  }
+                  if (TagConnected.at<uchar>(j,i) < 100)
+                  {
+                     blacks++;
                   }
               }
+              wordHist[i]=blacks;
             }
-
             tag++;
 
-            rectangle(imgOut, rect, Scalar(0, 255, 0), 2);
+            //print wordhist above word's rectangle
+            //normalize histogram and add it into final image
+            auto result = std::minmax_element (wordHist.begin(), wordHist.end());
+            int max = *result.second;
+            int min = *result.first;
+
+            uint col = rect.x;
+            for (uint i = 0; i < wordHist.size(); ++i)
+            {
+              wordHist[i] = (wordHist[i] - min) * 20 / (max - min);
+              uint row = rect.y;
+              for (uint r=0; r < wordHist[i]; ++r)
+              {
+                imgIn.at<Vec3b>(Point(col,row)) = black;
+                row--;
+              }
+              col++;
+            }
+
+            //rectangle(imgOut, rect, Scalar(0, 255, 0), 2);
         }
     }
     //imshow("tagssss",bitmapOfTag);
@@ -291,13 +357,26 @@ void MainWindow::WordSplit()
     ConvertQImageToRGB888();
     Mat image1;
     convertQImageToMat(Image2, image1);
-    Mat wordsImage, tagImage;
-    detectWords(image1, wordsImage, tagImage);
+    Mat tagImage;
+
+    detectWords(image1, tagImage);
+
     if(!bBatchActive) //show output if Batch is inactive
     {
-        convertMatToQimage(wordsImage, Image2);
+        //color image1 using tagImage to show lines
+        for(int r=0; r<tagImage.rows; ++r){
+            for(int c=0; c<tagImage.cols; ++c){
+                uchar tagValue = tagImage.at<uchar>(r,c);
+                if (tagValue == 0) {continue;}
+
+                image1.at<Vec3b>(Point(c,r)) = colours[tagValue % 6];
+            }
+        }
+
+        convertMatToQimage(image1, Image2);
         SetImageToView(Image2, eView::second);
     }
+
     string fpath(openedFileInfo.absolutePath().toStdString() +"/dat_words/");
     QDir dir(QString(fpath.c_str()));
     if(!dir.exists())
@@ -346,27 +425,47 @@ void MainWindow::on_pushButton_4_clicked()
     ui->graphicsView_2->fitInView(scene2->sceneRect(),Qt::KeepAspectRatio);
 }
 
+void MainWindow::on_pushButton_5_clicked(){  //OK: for Binary Threshold
+
+        //int result = QMessageBox::question(this, "Binarization", buffer, QMessageBox::Ok | QMessageBox::Cancel);
+        HorizontalRlsa();
+}
+
+void MainWindow::on_pushButton_6_clicked()
+{
+        HorizontalRlsaWords();
+}
+
 //expects grayscale image as input parameter
-std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag)
+std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram)
 {
     Mat imageRLSA;
-    horRlsa(img, imageRLSA);
+    int rlsaThres = 70;
+    horRlsa(img, imageRLSA, rlsaThres);
 
     Mat &gray = imageRLSA;
     uchar threshhold = 127;
 
     //create horizontal hist
     std::vector<int> blacksVec(gray.rows, 0);
+    std::vector<int> blacksRowVec(gray.rows, 0);
     for (int x = 0; x<gray.rows; x++) {
        int blacks = 0;
+       int blacksRow = 0;
        for (int y = 0; y<gray.cols/4; y++) {
            // count black pixels per line
            if (gray.at<uchar>(x, y) < threshhold) {
-               blacks++;
+               if(y<gray.cols/4)
+               {
+                   blacks++; //quarter of row
+               }
+               blacksRow++;
            }
        }
        blacksVec[x]=blacks;
+       blacksRowVec[x]=blacksRow;
     }
+    histogram = blacksRowVec;
 
     //Find peaks in histogram
     vector<float> blacksVecFloat(blacksVec.size());
@@ -440,18 +539,18 @@ void lineSplit(const string &imgFilepath)
 {
     Mat image = imread(imgFilepath);
     Mat tagImage;
-    std::vector<int> linesIndex = linesPosition(image,tagImage);
+    //std::vector<int> linesIndex = linesPosition(image,tagImage);
 
     //show out put
     //storebat
 }
 
-void horRlsa(const Mat &imgIn, Mat &imgOut)
+void horRlsa(const Mat &imgIn, Mat &imgOut, int rlsaThres)
 {
     cvtColor(imgIn, imgOut, CV_BGR2GRAY);
 
     int thres = 100; //binarization threshold
-    int rlsaThres = 70;
+
     for(int x=0;x<imgIn.rows;x++)
     {
         int last_black_pos=-1;  //last black pixel position
@@ -482,6 +581,136 @@ void horRlsa(const Mat &imgIn, Mat &imgOut)
         }
     }
 }
+
+//image is grayscale and has already blobs to detect
+void blobDetectionLines(Mat &imgGray, Mat &mask, int minWidth, int minHeight)
+{
+    uchar tag=1;
+    // find contours
+    mask = Mat::zeros(imgGray.size(), CV_8UC1);
+    Mat bw;
+    threshold(imgGray, bw, 0.0, 255.0, THRESH_BINARY | THRESH_OTSU);
+
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+    hierarchy.size();
+    findContours(bw, contours, hierarchy, RETR_TREE, CV_CHAIN_APPROX_SIMPLE, Point(0, 0));
+    // filter contours
+    for (int idx = contours.size()-1; idx>=1; idx--)
+    {
+        Rect rect = boundingRect(contours[idx]);
+
+        if (rect.height > minHeight && rect.width > minWidth) /* constraints on region size */
+        {
+              // fill the contour
+              drawContours(mask, contours, idx, Scalar(tag), CV_FILLED);
+              tag++;
+        }
+    }
+//    imshow("img Rows detected",mask);
+}
+
+void MainWindow::FuzzyRlsa()
+{
+    if(!CheckImageIsLoaded()) { return; }
+
+    ConvertQImageToRGB888();
+
+    Mat image1;
+    convertQImageToMat(Image2, image1);
+    Mat imageRLSA;
+    fuzzyRlsa(image1, imageRLSA);
+
+    if(!bBatchActive) //show output if Batch is inactive
+    {
+        //color image1 using tagImage to show lines
+//        for(int r=0; r<tagImage.rows; ++r){
+//            for(int c=0; c<tagImage.cols; ++c){
+//                uchar tagValue = tagImage.at<uchar>(r,c);
+//                if (tagValue == 0) {continue;}
+
+//                image1.at<Vec3b>(Point(c,r)) = colours[tagValue % 6];
+//            }
+//        }
+
+        convertMatToQimage(imageRLSA, Image2);
+        SetImageToView(Image2, eView::second);
+    }
+
+}
+
+void fuzzyRlsa(const Mat &imgIn, Mat &imgOut)
+{
+    Mat imgGray;
+    cvtColor(imgIn, imgGray, CV_BGR2GRAY);
+    Mat imgTmp(imgGray.rows,imgGray.cols,CV_32SC1);
+    //imgOut = Mat(imgGray.rows,imgGray.cols,CV_8UC1,Scalar::all(0));
+    int thres = 100; //binarization threshold
+    uint maxBlockCnt = 43;
+
+    //left to right
+    for(int x=0;x<imgIn.rows;x++)
+    {
+        std::queue<int> BlkQ;
+        for(int y=0;y<imgIn.cols;y++)
+        {
+            if((int)imgGray.at<uchar>(x,y) < thres) // black pixel
+                BlkQ.push(y);
+
+            if(BlkQ.size() > maxBlockCnt)
+            {
+                imgTmp.at<int>(x,y) = y - BlkQ.front();
+                BlkQ.pop();
+            }
+            else
+            {
+                if(y != 0)
+                    imgTmp.at<int>(x,y) = imgTmp.at<int>(x,y-1)+1;
+                else
+                    imgTmp.at<int>(x,y) = imgTmp.at<int>(x,0)+1;
+            }
+        }
+    }
+    //right to left
+    for(int x=imgIn.rows-1;x>=0;x--)
+    {
+        std::queue<int> BlkQ;
+        for(int y=imgIn.cols-1;y>=0;y--)
+        {
+            if((int)imgGray.at<uchar>(x,y) < thres) // black pixel
+                BlkQ.push(imgIn.cols-1-y);
+
+            if(BlkQ.size() > maxBlockCnt)
+            {
+                imgTmp.at<int>(x,y) = (imgIn.cols-1 - y) - BlkQ.front();
+                BlkQ.pop();
+            }
+            else
+            {
+                if(y != imgIn.cols-1)
+                    imgTmp.at<int>(x,y) += imgTmp.at<int>(x,y+1)+1;
+                else
+                    imgTmp.at<int>(x,y) += imgTmp.at<int>(x,imgIn.cols-1)+1;
+            }
+        }
+    }
+
+    double min, max;
+    cv::minMaxLoc(imgTmp, &min, &max);
+    qDebug(string("min:" + to_string(min) + " max:" + to_string(max)).c_str());
+    //Mat normalizedImg(imgGray.rows,imgGray.cols,CV_8UC1);
+    //cv::normalize(imgTmp,  normalizedImg, 0, 255, cv::NORM_MINMAX);
+
+    imshow("Fuzzy runlength",imgTmp);
+    Mat dest;
+    //threshold output image by saving result to imgOut.
+    int thres1 = 5000;
+    //imgTmp.setTo(0,imgTmp<=thres1);
+    //imgTmp.setTo(2248257,imgTmp>thres1);
+    imgOut = Mat::zeros(imgGray.size(), CV_8UC1);
+    imgOut.setTo(255,imgTmp>thres1);
+}
+
 
 void convertQImageToMat(QImage *qImg, Mat &matImg)
 {
@@ -537,7 +766,62 @@ bool MainWindow::CheckImageIsLoaded()
     return true;
 }
 
-void MainWindow::HorizontalRlsa()
+void MainWindow::HorizontalRlsaWords()
+{
+    if(!CheckImageIsLoaded()) { return; }
+
+    ConvertQImageToRGB888();
+
+    Mat image1;
+    convertQImageToMat(Image2, image1);
+    Mat imageRLSA;
+
+    QString spinB_Threshold = ui->spinBox_2->text();
+    int rlsaThres = spinB_Threshold.toInt();
+    if (rlsaThres < 1) { rlsaThres = 1;}
+    horRlsa(image1, imageRLSA, rlsaThres);
+    Mat maskImage;
+    blobDetectionLines(imageRLSA, maskImage, 30, 20);
+    Mat imageGray;
+    cvtColor(image1, imageGray, CV_BGR2GRAY);
+    if(!bBatchActive) //show output if Batch is inactive
+    {
+        //show rlsa image
+        imshow("RLSA image - words", imageRLSA);
+        //color image1 using maskImage to show lines
+        for(int r=0; r<maskImage.rows; ++r){
+            for(int c=0; c<maskImage.cols; ++c){
+                uchar maskValue = maskImage.at<uchar>(r,c);
+                if (maskValue == 0 || imageGray.at<uchar>(r,c)>120 ) {continue;}
+                image1.at<Vec3b>(Point(c,r)) = colours[maskValue % 6];
+            }
+        }
+
+        convertMatToQimage(image1, Image2);
+        SetImageToView(Image2, eView::second);
+    }
+
+    //store file
+    string fpath(openedFileInfo.absolutePath().toStdString() +"/dat_words_rlsa/");
+    QDir dir(QString(fpath.c_str()));
+    if(!dir.exists())
+    {
+        openedFileInfo.absoluteDir().mkdir("dat_words_rlsa");
+    }
+    fpath += datFilename;
+    FILE *fp = fopen(fpath.c_str(),"wb+");  //Copying the Image to filename.dat file
+    uchar ch[4];
+    memset(ch,0,4);
+    for(int r=0; r<maskImage.rows; ++r)
+        for(int c=0; c<maskImage.cols; ++c){
+            ch[0] = maskImage.at<uchar>(r,c);
+            fwrite(&ch, sizeof(int), 1, fp);
+        }
+
+    fclose(fp);
+}
+
+void MainWindow::HorizontalRlsa() //lines
 {    
     if(!CheckImageIsLoaded()) { return; }
 
@@ -546,10 +830,50 @@ void MainWindow::HorizontalRlsa()
     Mat image1;
     convertQImageToMat(Image2, image1);
     Mat imageRLSA;
-    horRlsa(image1, imageRLSA);
 
-    convertMatToQimage(imageRLSA, Image2);
-    SetImageToView(Image2, eView::second);
+    QString spinB_Threshold = ui-> spinBox->text();
+    int rlsaThres = spinB_Threshold.toInt();
+    if (rlsaThres < 1) { rlsaThres = 1;}
+    horRlsa(image1, imageRLSA, rlsaThres);
+    Mat maskImage;
+    blobDetectionLines(imageRLSA, maskImage, 150, 30);
+    Mat imageGray;
+    cvtColor(image1, imageGray, CV_BGR2GRAY);
+    if(!bBatchActive) //show output if Batch is inactive
+    {
+        //show rlsa image
+        imshow("RLSA image - lines", imageRLSA);
+        //color image1 using maskImage to show lines
+        for(int r=0; r<maskImage.rows; ++r){
+            for(int c=0; c<maskImage.cols; ++c){
+                uchar maskValue = maskImage.at<uchar>(r,c);
+                if (maskValue == 0 || imageGray.at<uchar>(r,c)>120 ) {continue;}
+                image1.at<Vec3b>(Point(c,r)) = colours[maskValue % 6];
+            }
+        }
+
+        convertMatToQimage(image1, Image2);
+        SetImageToView(Image2, eView::second);
+    }
+
+    //store file
+    string fpath(openedFileInfo.absolutePath().toStdString() +"/dat_lines_rlsa/");
+    QDir dir(QString(fpath.c_str()));
+    if(!dir.exists())
+    {
+        openedFileInfo.absoluteDir().mkdir("dat_lines_rlsa");
+    }
+    fpath += datFilename;
+    FILE *fp = fopen(fpath.c_str(),"wb+");  //Copying the Image to filename.dat file
+    uchar ch[4];
+    memset(ch,0,4);
+    for(int r=0; r<maskImage.rows; ++r)
+        for(int c=0; c<maskImage.cols; ++c){
+            ch[0] = maskImage.at<uchar>(r,c);
+            fwrite(&ch, sizeof(int), 1, fp);
+        }
+
+    fclose(fp);
 }
 
 
