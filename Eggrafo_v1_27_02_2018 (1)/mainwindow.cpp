@@ -50,9 +50,10 @@ void findPeaks(vector<float> x0, vector<int>& peakInds);
 void horRlsa(const Mat &imgIn, Mat &imgOut, int rlsaThres);
 void convertQImageToMat(QImage *qImg, Mat &matImg);
 void convertMatToQimage(Mat &matImg, QImage *qImg);
-std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram);
-void fuzzyRlsa(const Mat &imgIn, Mat &imgOut);
+std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram, double linePercentage);
+void fuzzyRlsa(const Mat &imgIn, Mat &imgOut, int thres, int maxBlockThres);
 void blobDetectionLines(Mat &imgGray, Mat &mask, int minWidth, int minHeight);
+void detectWordsProjections(Mat &imgIn, Mat &bitmapOfTag, std::vector<int> &linesIndex, vector<vector<int> > &RowColsHist, std::vector<int> &linesTopIndex, int wordSpacing);
 /////////////////////////////////////////////
 
 
@@ -104,10 +105,15 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::BatchProcess()
+void MainWindow::BatchProcessHelper(bool bLines, bool bwords, bool bRlsaLines, bool bRlsaWords, bool bFuzzyLines, bool bFuzzyWords)
 {
     //select directory to process contents
-    QDir directory = QFileDialog::getExistingDirectory(this, tr("select directory"));
+    QString directoryStr = QFileDialog::getExistingDirectory(this, tr("select directory"));
+    if(directoryStr.isEmpty() || directoryStr == "")
+    {
+        return;
+    }
+    QDir directory(directoryStr);
     QStringList imageList = directory.entryList(QStringList() << "*.tif" << "*.TIF" << "*.jpg" << "*.JPG" ,QDir::Files);
     bBatchActive = true;
     QString information = "Batch Prossess active for Directory: " + directory.absolutePath();
@@ -116,19 +122,27 @@ void MainWindow::BatchProcess()
         //open file
         openFileHelper(directory.absoluteFilePath(imageFile));
         //find lines
-        LineSplit();
+        if (bLines) { LineSplit(); }
         //find words
-        WordSplit();
+        if (bwords) { WordSplit(); }
         //rlsa lines
-        HorizontalRlsa();
+        if (bRlsaLines) { HorizontalRlsa(); }
         //rlsa words
-        HorizontalRlsaWords();
+        if (bRlsaWords) { HorizontalRlsaWords(); }
+        //fuzzy RL lines
+        if (bFuzzyLines) { FuzzyRlsa(); }
+        //fuzzy RL words
+        if (bFuzzyWords) { FuzzyRlsaWords(); }
     }
     bBatchActive = false;
     information = "Batch Prossess for Directory: " + directory.absolutePath() + " is Finished";
     ui->label->setText(information);
 }
 
+void MainWindow::BatchProcess()
+{
+    BatchProcessHelper(true, true, true, true, true, true);
+}
 
 void MainWindow::SetImageToView(QImage *pImg, eView view)
 {
@@ -165,7 +179,7 @@ void MainWindow::openFileHelper(QString const &filePath)
         {
             SetImageToView(Image1, eView::first);
 
-            QString information = "BPP: "+QString::number(bpp)+"\nWidth: "+QString::number(Ix)+"\nHeight: "+QString::number(Iy);
+            QString information = "BPP: "+QString::number(bpp)+" , Width: "+QString::number(Ix)+" , Height: "+QString::number(Iy);
             ui->label->setText(information);
         }
     }
@@ -187,7 +201,7 @@ void MainWindow::Inv()
     for(uint y=0;y<Iy;y++)
     {
         for(uint x=0;x<Ix;x++)
-        {            
+        {
             unsigned char u = (unsigned char) qGray(Image1->pixel(x,y));
             Image2->setPixel(x, y, qRgb(255-u,255-u,255-u));
         }
@@ -206,9 +220,9 @@ void MainWindow::LineSplit() {
     Mat image1, tagImage;
 
     convertQImageToMat(Image2, image1);
-
+    double linePercentage = ui->doubleSpinBox->value();
     std::vector<int> linesHist;
-    std::vector<int> linesIndex = linesPosition(image1,tagImage,linesHist);
+    std::vector<int> linesIndex = linesPosition(image1,tagImage,linesHist,linePercentage);
 
     if(!bBatchActive) //show output if Batch is inactive
     {
@@ -261,7 +275,61 @@ void MainWindow::LineSplit() {
 
 }
 
-void detectWords(Mat &imgIn, Mat &bitmapOfTag)
+void detectWordsProjections(Mat &imgIn, Mat &bitmapOfTag, std::vector<int> &linesIndex, vector<vector<int> > &RowColsHist, std::vector<int> &linesTopIndex, int wordSpacing)
+{
+    int thres = wordSpacing;
+    Mat imgGray;
+    cvtColor(imgIn, imgGray, CV_BGR2GRAY);
+
+    bitmapOfTag = Mat::zeros(imgGray.size(), CV_8UC1);
+
+    int bottomOfLine = 0;
+    int topOfLine;
+     uint tag=1;
+    //calculate horiz hist based on line detection
+    for (uint i = 0; i < linesIndex.size(); ++i)
+    {
+        if (i == linesIndex.size() - 1) //last row top
+        {
+            topOfLine = imgGray.rows-1;
+        }
+        else
+        {
+            topOfLine = (linesIndex[i] + linesIndex[i+1])/2;
+        }
+        int lastBlackPxlIndex=-1;
+        for (uint c=0; c<imgGray.cols; c++)
+        {
+            bool foundBlack = false;
+            for(int r = bottomOfLine; r < topOfLine; r++ )
+            {
+                if(imgGray.at<uchar>(r,c) < 100)
+                {
+                   RowColsHist[i][c]++;
+                   foundBlack = true;
+                   bitmapOfTag.at<uchar>(r,c) = tag;
+                   if(linesTopIndex[i]>r) { linesTopIndex[i] = r;}
+                }
+            }
+            if(foundBlack)
+            {
+              if(lastBlackPxlIndex > -1) //not the first blck pxl for this row
+              {
+                  if(c - lastBlackPxlIndex > thres) //gap between words
+                  {
+                      tag++;
+                  }
+              }
+              lastBlackPxlIndex = c;
+            }
+
+        }
+
+        bottomOfLine = topOfLine; //for next iteration, previous line top + 1;
+    }
+}
+
+void detectWords(Mat &imgIn, Mat &bitmapOfTag, int morphSize)
 {
     Mat imgGray;
     cvtColor(imgIn, imgGray, CV_BGR2GRAY);
@@ -274,9 +342,8 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
     threshold(grad, bw, 0.0, 255.0, THRESH_BINARY | THRESH_OTSU);
     // connect horizontally oriented regions
     Mat connected;
-    morphKernel = getStructuringElement(MORPH_RECT, Size(18, 1));
+    morphKernel = getStructuringElement(MORPH_RECT, Size(morphSize, 1)); //do it as ui label
     morphologyEx(bw, connected, MORPH_CLOSE, morphKernel);
-
     //store tags of words in image
     bitmapOfTag = Mat::zeros(imgGray.size(), CV_8UC1);
     uchar tag=1;
@@ -296,7 +363,6 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
         drawContours(mask, contours, idx, Scalar(255, 255, 255), CV_FILLED);
         // ratio of non-zero pixels in the filled region
         double r = (double)countNonZero(maskROI)/(rect.width*rect.height);
-
         if (r > .1 /* assume at least 10% of the area is filled if it contains text */
             && (rect.height > 14 && rect.width > 24)) /* constraints on region size */
         {
@@ -304,7 +370,7 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
             cv::Mat TagRoi = bitmapOfTag(rect);
             cv::Mat TagGray = imgGray(rect);
             cv::Mat TagConnected = connected(rect);
-            vector<int> wordHist(TagGray.cols, 0);;
+            vector<int> wordHist(TagGray.cols, 0);
             for (int i=0;i<TagRoi.cols;i++)
             {
               int blacks=0;
@@ -329,7 +395,6 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
             auto result = std::minmax_element (wordHist.begin(), wordHist.end());
             int max = *result.second;
             int min = *result.first;
-
             uint col = rect.x;
             for (uint i = 0; i < wordHist.size(); ++i)
             {
@@ -338,11 +403,13 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
               for (uint r=0; r < wordHist[i]; ++r)
               {
                 imgIn.at<Vec3b>(Point(col,row)) = black;
-                row--;
+                if(row!=0)
+                {
+                    row--;
+                }
               }
               col++;
             }
-
             //rectangle(imgOut, rect, Scalar(0, 255, 0), 2);
         }
     }
@@ -353,13 +420,28 @@ void detectWords(Mat &imgIn, Mat &bitmapOfTag)
 void MainWindow::WordSplit()
 {
     if(!CheckImageIsLoaded()) { return; }
-
     ConvertQImageToRGB888();
     Mat image1;
     convertQImageToMat(Image2, image1);
-    Mat tagImage;
 
-    detectWords(image1, tagImage);
+
+    //QString spinBoxStr = ui->spinBox_7->text();
+    //int morphSize = spinBoxStr.toInt();
+    //detectWords(image1, tagImage, morphSize);
+
+    //detect lines
+    double linePercentage = ui->doubleSpinBox->value();
+    std::vector<int> linesHist;
+    Mat tagImageLines;
+    std::vector<int> linesIndex = linesPosition(image1,tagImageLines,linesHist,linePercentage);
+    //detect words projections
+    Mat tagImage;
+    vector<vector<int> > RowColsHist(linesIndex.size(), vector<int>(image1.cols));
+    std::vector<int> linesTopIndex(linesIndex.size(), INT_MAX);
+    QString spinBoxStr = ui->spinBox_7->text();
+    int wordSpacing = spinBoxStr.toInt();
+    detectWordsProjections(image1, tagImage, linesIndex, RowColsHist, linesTopIndex, wordSpacing);
+
 
     if(!bBatchActive) //show output if Batch is inactive
     {
@@ -370,6 +452,21 @@ void MainWindow::WordSplit()
                 if (tagValue == 0) {continue;}
 
                 image1.at<Vec3b>(Point(c,r)) = colours[tagValue % 6];
+            }
+        }
+        qDebug(string("lines Index: " + to_string(linesTopIndex.size())).c_str());
+
+        for(int l=0; l<linesTopIndex.size(); l++)
+        {
+            for(int c=0; c<image1.cols; c++)
+            {
+                int histSize = RowColsHist[l][c];
+                int start = linesTopIndex[l];
+                for(int r=start; r>start-histSize; r--)
+                {
+                    if(r<0){break;}
+                    image1.at<Vec3b>(Point(c,r)) = black;
+                }
             }
         }
 
@@ -425,26 +522,81 @@ void MainWindow::on_pushButton_4_clicked()
     ui->graphicsView_2->fitInView(scene2->sceneRect(),Qt::KeepAspectRatio);
 }
 
-void MainWindow::on_pushButton_5_clicked(){  //OK: for Binary Threshold
-
-        //int result = QMessageBox::question(this, "Binarization", buffer, QMessageBox::Ok | QMessageBox::Cancel);
-        HorizontalRlsa();
+void MainWindow::on_pushButton_5_clicked()
+{
+    HorizontalRlsa();
 }
 
 void MainWindow::on_pushButton_6_clicked()
 {
-        HorizontalRlsaWords();
+    HorizontalRlsaWords();
+}
+
+void MainWindow::on_pushButton_7_clicked()
+{
+    FuzzyRlsa();
+}
+
+void MainWindow::on_pushButton_8_clicked()
+{
+    //Fuzzy lines batch
+    BatchProcessHelper(false, false, false, false, true, false);
+}
+
+void MainWindow::on_pushButton_9_clicked()
+{
+    //rlsa lines batch
+    BatchProcessHelper(false, false, true, false, false, false);
+}
+
+void MainWindow::on_pushButton_10_clicked()
+{
+    //rlsa words batch
+    BatchProcessHelper(false, false, false, true, false, false);
+}
+
+void MainWindow::on_pushButton_11_clicked()
+{
+    FuzzyRlsaWords();
+}
+
+void MainWindow::on_pushButton_12_clicked()
+{
+    //Fuzzy words batch
+    BatchProcessHelper(false, false, false, false, false, true);
+}
+
+void MainWindow::on_pushButton_13_clicked()
+{
+    LineSplit();
+}
+
+void MainWindow::on_pushButton_14_clicked()
+{
+    //lines batch
+    BatchProcessHelper(true, false, false, false, false, false);
+}
+
+void MainWindow::on_pushButton_15_clicked()
+{
+    //words batch
+    BatchProcessHelper(false, true, false, false, false, false);
+}
+
+void MainWindow::on_pushButton_16_clicked()
+{
+    WordSplit();
 }
 
 //expects grayscale image as input parameter
-std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram)
+std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &histogram, double linePercentage)
 {
     Mat imageRLSA;
-    int rlsaThres = 70;
-    horRlsa(img, imageRLSA, rlsaThres);
-
+    //int rlsaThres = 70;
+    //horRlsa(img, imageRLSA, rlsaThres);
+    cvtColor(img,imageRLSA,CV_BGR2GRAY);
     Mat &gray = imageRLSA;
-    uchar threshhold = 127;
+    uchar threshhold = 127; //doesn't affect the algorithm as all the input images are black and white. (0 black, 255 white)
 
     //create horizontal hist
     std::vector<int> blacksVec(gray.rows, 0);
@@ -452,7 +604,8 @@ std::vector<int> linesPosition(Mat &img, Mat &bitmapOfTag, std::vector<int> &his
     for (int x = 0; x<gray.rows; x++) {
        int blacks = 0;
        int blacksRow = 0;
-       for (int y = 0; y<gray.cols/4; y++) {
+       int columns = lround(gray.cols * linePercentage);
+       for (int y = 0; y<columns; y++) {
            // count black pixels per line
            if (gray.at<uchar>(x, y) < threshhold) {
                if(y<gray.cols/4)
@@ -549,6 +702,7 @@ void horRlsa(const Mat &imgIn, Mat &imgOut, int rlsaThres)
 {
     cvtColor(imgIn, imgOut, CV_BGR2GRAY);
 
+    //doesn't affect the algorithm as all the input images are black and white. (0 black, 255 white)
     int thres = 100; //binarization threshold
 
     for(int x=0;x<imgIn.rows;x++)
@@ -610,7 +764,7 @@ void blobDetectionLines(Mat &imgGray, Mat &mask, int minWidth, int minHeight)
 //    imshow("img Rows detected",mask);
 }
 
-void MainWindow::FuzzyRlsa()
+void MainWindow::FuzzyRlsa() //lines
 {
     if(!CheckImageIsLoaded()) { return; }
 
@@ -619,34 +773,120 @@ void MainWindow::FuzzyRlsa()
     Mat image1;
     convertQImageToMat(Image2, image1);
     Mat imageRLSA;
-    fuzzyRlsa(image1, imageRLSA);
-
+    int thres = ui->spinBox_3->value();
+    int maxBlockThres = ui->spinBox_5->value();
+    fuzzyRlsa(image1, imageRLSA, thres, maxBlockThres);
+    Mat maskImage;
+    blobDetectionLines(imageRLSA, maskImage, 150, 30);
+    Mat imageGray;
+    cvtColor(image1, imageGray, CV_BGR2GRAY);
     if(!bBatchActive) //show output if Batch is inactive
     {
-        //color image1 using tagImage to show lines
-//        for(int r=0; r<tagImage.rows; ++r){
-//            for(int c=0; c<tagImage.cols; ++c){
-//                uchar tagValue = tagImage.at<uchar>(r,c);
-//                if (tagValue == 0) {continue;}
-
-//                image1.at<Vec3b>(Point(c,r)) = colours[tagValue % 6];
-//            }
-//        }
-
-        convertMatToQimage(imageRLSA, Image2);
+        //show fuzzy runlength image
+        imshow("Fuzzy runlength image - lines", imageRLSA);
+        //color image1 using maskImage to show lines
+        for(int r=0; r<maskImage.rows; ++r){
+            for(int c=0; c<maskImage.cols; ++c){
+                uchar maskValue = maskImage.at<uchar>(r,c);
+                if (maskValue == 0 || imageGray.at<uchar>(r,c)>120 ) {continue;}
+                image1.at<Vec3b>(Point(c,r)) = colours[maskValue % 6];
+            }
+        }
+        convertMatToQimage(image1, Image2);
         SetImageToView(Image2, eView::second);
     }
 
+    string fpath(openedFileInfo.absolutePath().toStdString() +"/dat_lines_fuzzy/");
+    QDir dir(QString(fpath.c_str()));
+    if(!dir.exists())
+    {
+        openedFileInfo.absoluteDir().mkdir("dat_lines_fuzzy");
+    }
+    fpath += datFilename;
+    FILE *fp = fopen(fpath.c_str(),"wb+");  //Copying the Image to filename.dat file
+    uchar ch[4];
+    memset(ch,0,4);
+    for(int r=0; r<maskImage.rows; ++r)
+        for(int c=0; c<maskImage.cols; ++c){
+            if(imageGray.at<uchar>(r,c)>120){
+                memset(ch,0,4);
+            }
+            else
+            {
+                ch[0] = maskImage.at<uchar>(r,c);
+            }
+            fwrite(&ch, sizeof(int), 1, fp);
+        }
+    fclose(fp);
+
+
 }
 
-void fuzzyRlsa(const Mat &imgIn, Mat &imgOut)
+void MainWindow::FuzzyRlsaWords() //words
+{
+    if(!CheckImageIsLoaded()) { return; }
+
+    ConvertQImageToRGB888();
+
+    Mat image1;
+    convertQImageToMat(Image2, image1);
+    Mat imageRLSA;
+    QString spin_Threshold = ui->spinBox_3->text();
+    int thres = ui->spinBox_4->value();
+    int maxBlockThres = ui->spinBox_6->value();
+    fuzzyRlsa(image1, imageRLSA, thres, maxBlockThres);
+    Mat maskImage;
+    blobDetectionLines(imageRLSA, maskImage, 30, 20);
+    Mat imageGray;
+    cvtColor(image1, imageGray, CV_BGR2GRAY);
+    if(!bBatchActive) //show output if Batch is inactive
+    {
+        //show fuzzy runlength image
+        imshow("Fuzzy runlength image - lines", imageRLSA);
+        //color image1 using maskImage to show lines
+        for(int r=0; r<maskImage.rows; ++r){
+            for(int c=0; c<maskImage.cols; ++c){
+                uchar maskValue = maskImage.at<uchar>(r,c);
+                if (maskValue == 0 || imageGray.at<uchar>(r,c)>120 ) {continue;}
+                image1.at<Vec3b>(Point(c,r)) = colours[maskValue % 6];
+            }
+        }
+        convertMatToQimage(image1, Image2);
+        SetImageToView(Image2, eView::second);
+    }
+
+    //store file
+    string fpath(openedFileInfo.absolutePath().toStdString() +"/dat_words_fuzzy/");
+    QDir dir(QString(fpath.c_str()));
+    if(!dir.exists())
+    {
+        openedFileInfo.absoluteDir().mkdir("dat_words_fuzzy");
+    }
+    fpath += datFilename;
+    FILE *fp = fopen(fpath.c_str(),"wb+");  //Copying the Image to filename.dat file
+    uchar ch[4];
+    memset(ch,0,4);
+    for(int r=0; r<maskImage.rows; ++r)
+        for(int c=0; c<maskImage.cols; ++c){
+            if(imageGray.at<uchar>(r,c)>120){  //white pixel
+                memset(ch,0,4);
+            }else{
+                ch[0] = maskImage.at<uchar>(r,c);
+            }
+            fwrite(&ch, sizeof(int), 1, fp);
+        }
+
+    fclose(fp);
+
+}
+
+void fuzzyRlsa(const Mat &imgIn, Mat &imgOut, int thres, int maxBlockThres)
 {
     Mat imgGray;
     cvtColor(imgIn, imgGray, CV_BGR2GRAY);
     Mat imgTmp(imgGray.rows,imgGray.cols,CV_32SC1);
-    //imgOut = Mat(imgGray.rows,imgGray.cols,CV_8UC1,Scalar::all(0));
-    int thres = 100; //binarization threshold
-    uint maxBlockCnt = 43;
+    int thres_bw= 100; //binarization threshold
+    int maxBlockCnt = maxBlockThres; //sugestion from paper 43
 
     //left to right
     for(int x=0;x<imgIn.rows;x++)
@@ -654,7 +894,7 @@ void fuzzyRlsa(const Mat &imgIn, Mat &imgOut)
         std::queue<int> BlkQ;
         for(int y=0;y<imgIn.cols;y++)
         {
-            if((int)imgGray.at<uchar>(x,y) < thres) // black pixel
+            if((int)imgGray.at<uchar>(x,y) < thres_bw) // black pixel
                 BlkQ.push(y);
 
             if(BlkQ.size() > maxBlockCnt)
@@ -677,7 +917,7 @@ void fuzzyRlsa(const Mat &imgIn, Mat &imgOut)
         std::queue<int> BlkQ;
         for(int y=imgIn.cols-1;y>=0;y--)
         {
-            if((int)imgGray.at<uchar>(x,y) < thres) // black pixel
+            if((int)imgGray.at<uchar>(x,y) < thres_bw) // black pixel
                 BlkQ.push(imgIn.cols-1-y);
 
             if(BlkQ.size() > maxBlockCnt)
@@ -697,18 +937,13 @@ void fuzzyRlsa(const Mat &imgIn, Mat &imgOut)
 
     double min, max;
     cv::minMaxLoc(imgTmp, &min, &max);
-    qDebug(string("min:" + to_string(min) + " max:" + to_string(max)).c_str());
-    //Mat normalizedImg(imgGray.rows,imgGray.cols,CV_8UC1);
-    //cv::normalize(imgTmp,  normalizedImg, 0, 255, cv::NORM_MINMAX);
+   // qDebug(string("min:" + to_string(min) + " max:" + to_string(max)).c_str());
 
     imshow("Fuzzy runlength",imgTmp);
     Mat dest;
     //threshold output image by saving result to imgOut.
-    int thres1 = 5000;
-    //imgTmp.setTo(0,imgTmp<=thres1);
-    //imgTmp.setTo(2248257,imgTmp>thres1);
     imgOut = Mat::zeros(imgGray.size(), CV_8UC1);
-    imgOut.setTo(255,imgTmp>thres1);
+    imgOut.setTo(255,imgTmp>thres);
 }
 
 
@@ -814,7 +1049,11 @@ void MainWindow::HorizontalRlsaWords()
     memset(ch,0,4);
     for(int r=0; r<maskImage.rows; ++r)
         for(int c=0; c<maskImage.cols; ++c){
-            ch[0] = maskImage.at<uchar>(r,c);
+            if(imageGray.at<uchar>(r,c)>120){  //white pixel
+                memset(ch,0,4);
+            }else{
+                ch[0] = maskImage.at<uchar>(r,c);
+            }
             fwrite(&ch, sizeof(int), 1, fp);
         }
 
@@ -822,7 +1061,7 @@ void MainWindow::HorizontalRlsaWords()
 }
 
 void MainWindow::HorizontalRlsa() //lines
-{    
+{
     if(!CheckImageIsLoaded()) { return; }
 
     ConvertQImageToRGB888();
@@ -869,7 +1108,11 @@ void MainWindow::HorizontalRlsa() //lines
     memset(ch,0,4);
     for(int r=0; r<maskImage.rows; ++r)
         for(int c=0; c<maskImage.cols; ++c){
-            ch[0] = maskImage.at<uchar>(r,c);
+            if(imageGray.at<uchar>(r,c)>120){  //white pixel
+                memset(ch,0,4);
+            }else{
+                ch[0] = maskImage.at<uchar>(r,c);
+            }
             fwrite(&ch, sizeof(int), 1, fp);
         }
 
